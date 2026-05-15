@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useAudio } from './hooks/useAudio';
+import { useHandTracking } from './hooks/useHandTracking';
 import { motion, AnimatePresence } from 'motion/react';
 import { Canvas } from '@react-three/fiber';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
@@ -8,16 +9,16 @@ import * as Tone from 'tone';
 import * as THREE from 'three';
 import { db, handleFirestoreError, OperationType } from './lib/firebase';
 import { doc, onSnapshot, setDoc, getDocFromServer } from 'firebase/firestore';
+import { Camera, CameraOff } from 'lucide-react';
 
 export default function App() {
-  const { isStarted, isMuted, toggleMute, startAudio, stopAudio, triggerNote, setMusicEvolution, evolution, getAudioData } = useAudio();
+  const { isStarted, startAudio, triggerNote, setMusicEvolution, evolution, getAudioData } = useAudio();
+  const { isHandOpen, hasHandDetected, isCameraActive, startCamera, stopCamera } = useHandTracking();
   const [audioData, setAudioData] = useState(new Float32Array(1024));
-  const [flowText, setFlowText] = useState<string | undefined>(undefined);
   const [activeNodes, setActiveNodes] = useState<string[]>([]);
   const [interactionPoint, setInteractionPoint] = useState<THREE.Vector3 | null>(null);
   const [mode, setMode] = useState<'idle' | 'interaction' | 'flow' | 'climax'>('idle');
   const [intensity, setIntensity] = useState(0);
-  const [remotePulse, setRemotePulse] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'error' | 'connecting'>('connecting');
   const intensityRef = useRef(0);
   const requestRef = useRef<number>(null);
@@ -72,10 +73,6 @@ export default function App() {
           const point = new THREE.Vector3(data.lastInteraction.x, data.lastInteraction.y, data.lastInteraction.z);
           setInteractionPoint(point);
           triggerNote("C3");
-          
-          // Trigger a visual pulse for remote interaction
-          setRemotePulse(true);
-          setTimeout(() => setRemotePulse(false), 1000);
         }
 
         // Sync active nodes
@@ -100,8 +97,8 @@ export default function App() {
   const animate = useCallback(() => {
     setAudioData(getAudioData());
     
-    // Decay intensity - slightly slower decay to allow building up color
-    intensityRef.current = Math.max(0, intensityRef.current - 0.012);
+    // Decay intensity - slower decay for more "lingering" feel
+    intensityRef.current = Math.max(0, intensityRef.current - 0.005);
     setIntensity(intensityRef.current);
 
     requestRef.current = requestAnimationFrame(animate);
@@ -115,65 +112,6 @@ export default function App() {
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
     };
   }, [isStarted, animate]);
-
-  const handleEmitFlow = (text: string) => {
-    setFlowText(text);
-    const newMode = 'flow';
-    const newNodes = ["node_1", "node_2", "node_3", "node_4"];
-    
-    setMode(newMode);
-    setActiveNodes(newNodes);
-
-    syncToFirebase({
-      mode: newMode,
-      activeNodes: newNodes,
-      intensity: Math.min(1, intensityRef.current + 0.3),
-      evolution: Math.min(1, evolution + 0.1)
-    });
-
-    setTimeout(() => {
-      setFlowText(undefined);
-      setActiveNodes([]);
-      setMode('idle');
-      syncToFirebase({ mode: 'idle', activeNodes: [] });
-    }, 4000);
-
-    // Increase evolution and intensity
-    setMusicEvolution(Math.min(1, evolution + 0.1));
-    intensityRef.current = Math.min(1, intensityRef.current + 0.3);
-  };
-
-  const handleInteraction = (point: THREE.Vector3 | null, isInteracting: boolean) => {
-    setInteractionPoint(point);
-    const newMode = isInteracting ? 'interaction' : 'idle';
-    setMode(newMode);
-    
-    if (isInteracting) {
-      triggerNote("C3");
-      const newIntensity = Math.min(1, intensityRef.current + 0.05);
-      intensityRef.current = newIntensity;
-      
-      if (point) {
-        syncToFirebase({
-          lastInteraction: { x: point.x, y: point.y, z: point.z, timestamp: Date.now() },
-          intensity: newIntensity,
-          mode: newMode
-        });
-      }
-    }
-  };
-
-  const handleNodeTrigger = (id: string) => {
-    const notes = ["C4", "Eb4", "F4", "G4", "Bb4"];
-    triggerNote(notes[Math.floor(Math.random() * notes.length)]);
-    setMusicEvolution(Math.min(1, evolution + 0.01));
-    const newIntensity = Math.min(1, intensityRef.current + 0.1);
-    const newEvolution = Math.min(1, evolution + 0.01);
-    intensityRef.current = newIntensity;
-    setMusicEvolution(newEvolution);
-    
-    syncToFirebase({ intensity: newIntensity, evolution: newEvolution });
-  };
 
   const handleSplashPointerDown = async (e: React.PointerEvent) => {
     // Capture rect synchronously before any await
@@ -189,7 +127,7 @@ export default function App() {
     }
     
     await Tone.start();
-    const notes = ["C2", "G2", "C3", "E3", "G3", "A3", "C4", "E4"];
+    const notes = ["D4", "E4", "F#4", "A4", "B4", "D5", "E5", "A5"];
     triggerNote(notes[Math.floor(Math.random() * notes.length)]);
     
     const point = new THREE.Vector3(
@@ -215,8 +153,9 @@ export default function App() {
   };
 
   const handleSplashPointerMove = (e: React.PointerEvent) => {
-    if (!isStarted && mode === 'interaction' && e.currentTarget) {
-      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    if (mode === 'interaction' && e.currentTarget) {
+      const target = e.currentTarget as HTMLElement;
+      const rect = target.getBoundingClientRect();
       const point = new THREE.Vector3(
         ((e.clientX - rect.left) / rect.width) * 2 - 1,
         -((e.clientY - rect.top) / rect.height) * 2 + 1,
@@ -227,13 +166,11 @@ export default function App() {
   };
 
   const handleSplashPointerUp = () => {
-    if (!isStarted) {
-      // Delay clearing to let the ripple travel a bit
-      setTimeout(() => {
-        setInteractionPoint(null);
-        setMode('idle');
-      }, 500);
-    }
+    // Faster reset for better responsiveness
+    setTimeout(() => {
+      setInteractionPoint(null);
+      setMode('idle');
+    }, 100);
   };
 
   return (
@@ -253,11 +190,34 @@ export default function App() {
             mode={evolution > 0.8 ? 'climax' : mode} 
             intensity={intensity}
             isStarted={true}
+            isPaused={!isHandOpen}
           />
           <EffectComposer>
             <Bloom intensity={1.5 + intensity * 2} luminanceThreshold={0.2} luminanceSmoothing={0.9} />
           </EffectComposer>
         </Canvas>
+      </div>
+
+      {/* Interface Layer */}
+      <div className="absolute inset-0 z-20 flex pointer-events-none">
+        <div className="absolute top-6 left-6 pointer-events-auto">
+          <button
+            onClick={() => isCameraActive ? stopCamera() : startCamera()}
+            className={`p-3 rounded-full border transition-all duration-500 backdrop-blur-md ${isCameraActive ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-400' : 'border-white/10 bg-white/5 text-white/40 hover:border-white/20 hover:bg-white/10'}`}
+          >
+            {isCameraActive ? <Camera size={18} /> : <CameraOff size={18} />}
+          </button>
+          
+          {isCameraActive && (
+            <motion.div
+              initial={{ opacity: 0, x: -10 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="mt-3 px-3 py-1 bg-black/40 border border-white/10 rounded font-mono text-[8px] uppercase tracking-widest text-white/60"
+            >
+              System: {hasHandDetected ? (isHandOpen ? 'Open / 展开' : 'Closed / 握紧 (PAUSED)') : 'Searching for hand... / 搜寻手部...'}
+            </motion.div>
+          )}
+        </div>
       </div>
 
       {/* Minimal Sync Status Overlay */}
@@ -266,6 +226,21 @@ export default function App() {
           Sync_Offline
         </div>
       )}
+      {/* Particles Control Indicator */}
+      <div className="fixed bottom-6 right-6 flex flex-col items-end gap-2 pointer-events-none z-50">
+        <div className={`px-3 py-1.5 rounded-full text-[10px] font-mono tracking-widest uppercase transition-all duration-500 border ${
+          isCameraActive ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-gray-900/50 border-white/5 text-white/20'
+        }`}>
+          {isCameraActive ? (
+            <span className="flex items-center gap-2">
+              <div className={`w-1.5 h-1.5 rounded-full animate-pulse ${hasHandDetected ? 'bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]' : 'bg-gray-600'}`} />
+              Motion: {hasHandDetected ? (isHandOpen ? 'Tracking' : 'Paused') : 'Scanning...'}
+            </span>
+          ) : (
+            'Camera Offline'
+          )}
+        </div>
+      </div>
     </div>
   );
 }
