@@ -11,13 +11,20 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-const app = initializeApp(firebaseConfig);
+export const isFirebaseConfigured = Object.values(firebaseConfig).every(Boolean);
+
+const app = isFirebaseConfigured ? initializeApp(firebaseConfig) : null;
 // @ts-ignore
-export const db = getFirestore(app, import.meta.env.VITE_FIREBASE_DATABASE_ID);
-export const auth = getAuth();
+export const db = app ? getFirestore(app, import.meta.env.VITE_FIREBASE_DATABASE_ID) : null;
+export const auth = app ? getAuth(app) : null;
 
 // Test connection
 async function testConnection() {
+  if (!db) {
+    console.warn("Firebase is not configured; sync is disabled for local preview.");
+    return;
+  }
+
   try {
     const testDoc = doc(db, 'global', 'state');
     await getDocFromServer(testDoc);
@@ -61,12 +68,12 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+      userId: auth?.currentUser?.uid,
+      email: auth?.currentUser?.email,
+      emailVerified: auth?.currentUser?.emailVerified,
+      isAnonymous: auth?.currentUser?.isAnonymous,
+      tenantId: auth?.currentUser?.tenantId,
+      providerInfo: auth?.currentUser?.providerData?.map(provider => ({
         providerId: provider.providerId,
         email: provider.email,
       })) || []
@@ -76,5 +83,4 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   }
   const errorMsg = JSON.stringify(errInfo);
   console.error('Firestore Error: ', errorMsg);
-  throw new Error(errorMsg);
 }

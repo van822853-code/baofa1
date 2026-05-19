@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
-import { Hands, HAND_CONNECTIONS, Results } from '@mediapipe/hands';
-import { Camera } from '@mediapipe/camera_utils';
+import { Hands, Results } from '@mediapipe/hands';
 
 export function useHandTracking() {
   const [isHandOpen, setIsHandOpen] = useState(true);
+  const [openHandCount, setOpenHandCount] = useState(0);
   const [hasHandDetected, setHasHandDetected] = useState(false);
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const handsRef = useRef<Hands | null>(null);
-  const cameraRef = useRef<Camera | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const frameRef = useRef<number | null>(null);
 
   const isCameraActiveRef = useRef(false);
 
@@ -37,7 +39,7 @@ export function useHandTracking() {
     });
 
     hands.setOptions({
-      maxNumHands: 1,
+      maxNumHands: 2,
       modelComplexity: 1,
       minDetectionConfidence: 0.5,
       minTrackingConfidence: 0.5,
@@ -49,11 +51,7 @@ export function useHandTracking() {
       if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
         if (!hasHandDetected) console.log("Hand tracking active");
         setHasHandDetected(true);
-        const landmarks = results.multiHandLandmarks[0];
-        
-        // Simpler, more reliable open/closed logic
-        // If fingertip Y is lower than the second joint Y (PIP), it's considered "closed" (folded)
-        // Indices: Index(8, 6), Middle(12, 10), Ring(16, 14), Pinky(20, 18)
+
         const fingers = [
           { tip: 8, pip: 6 },
           { tip: 12, pip: 10 },
@@ -61,17 +59,22 @@ export function useHandTracking() {
           { tip: 20, pip: 18 }
         ];
 
-        let openCount = 0;
-        fingers.forEach(f => {
-          if (landmarks[f.tip].y < landmarks[f.pip].y) {
-            openCount++;
-          }
-        });
+        const detectedOpenHands = results.multiHandLandmarks.reduce((total, landmarks) => {
+          let openFingers = 0;
+          fingers.forEach(f => {
+            if (landmarks[f.tip].y < landmarks[f.pip].y) {
+              openFingers++;
+            }
+          });
+          return total + (openFingers >= 3 ? 1 : 0);
+        }, 0);
 
-        setIsHandOpen(openCount >= 2);
+        setOpenHandCount(detectedOpenHands);
+        setIsHandOpen(detectedOpenHands > 0);
       } else {
         setHasHandDetected(false);
         setIsHandOpen(true);
+        setOpenHandCount(0);
       }
     });
 
@@ -79,9 +82,8 @@ export function useHandTracking() {
 
     return () => {
       isCameraActiveRef.current = false;
-      if (cameraRef.current) {
-        cameraRef.current.stop();
-      }
+      if (frameRef.current) cancelAnimationFrame(frameRef.current);
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       if (handsRef.current) {
         handsRef.current.close();
       }
@@ -93,33 +95,49 @@ export function useHandTracking() {
     if (!videoRef.current || !handsRef.current) return;
 
     try {
-      if (cameraRef.current) {
-        cameraRef.current.stop();
-      }
+      setCameraError(null);
+      if (frameRef.current) cancelAnimationFrame(frameRef.current);
+      streamRef.current?.getTracks().forEach((track) => track.stop());
 
-      const camera = new Camera(videoRef.current, {
-        onFrame: async () => {
-          const video = videoRef.current;
-          const hands = handsRef.current;
-          
-          if (video && video.readyState >= 2 && hands && isCameraActiveRef.current) {
-            try {
-              await hands.send({ image: video });
-            } catch (e) {
-              // Ignore frame errors
-            }
-          }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          facingMode: 'user',
         },
-        width: 640,
-        height: 480,
+        audio: false,
       });
-      
-      cameraRef.current = camera;
-      await camera.start();
+
+      streamRef.current = stream;
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play();
       isCameraActiveRef.current = true;
       setIsCameraActive(true);
+
+      const processFrame = async () => {
+        const video = videoRef.current;
+        const hands = handsRef.current;
+
+        if (video && hands && isCameraActiveRef.current && video.readyState >= 2) {
+          try {
+            await hands.send({ image: video });
+          } catch {
+            // Ignore occasional MediaPipe frame errors.
+          }
+        }
+
+        if (isCameraActiveRef.current) {
+          frameRef.current = requestAnimationFrame(processFrame);
+        }
+      };
+
+      frameRef.current = requestAnimationFrame(processFrame);
     } catch (err) {
       console.error("Camera start failed:", err);
+      const message = err instanceof DOMException && err.name === 'NotAllowedError'
+        ? 'Camera permission denied / 摄像头权限被拒绝'
+        : 'Camera unavailable / 摄像头不可用';
+      setCameraError(message);
       isCameraActiveRef.current = false;
       setIsCameraActive(false);
     }
@@ -127,11 +145,15 @@ export function useHandTracking() {
 
   const stopCamera = () => {
     isCameraActiveRef.current = false;
-    cameraRef.current?.stop();
+    if (frameRef.current) cancelAnimationFrame(frameRef.current);
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
     setIsCameraActive(false);
     setIsHandOpen(true);
     setHasHandDetected(false);
+    setOpenHandCount(0);
   };
 
-  return { isHandOpen, hasHandDetected, isCameraActive, startCamera, stopCamera };
+  return { isHandOpen, openHandCount, hasHandDetected, isCameraActive, cameraError, startCamera, stopCamera };
 }
